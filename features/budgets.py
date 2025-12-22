@@ -1,15 +1,16 @@
-    from kickbase_api.user import get_budget, get_username
-    from kickbase_api.league import (
+from kickbase_api.user import get_budget, get_username
+from kickbase_api.league import (
     get_league_activities,
     get_league_ranking
-    )
-    from kickbase_api.manager import (
+)
+from kickbase_api.manager import (
     get_managers,
     get_manager_performance,
     get_manager_info,
-    )
-    from kickbase_api.others import get_achievement_reward
-    import pandas as pd
+)
+from kickbase_api.others import get_achievement_reward
+import pandas as pd
+
 
     def calc_manager_budgets(token, league_id, league_start_date, start_budget):
     """Calculate manager budgets based on activities, bonuses, and team performance."""
