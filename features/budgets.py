@@ -1,31 +1,49 @@
-from kickbase_api.user import get_budget, get_username
-from kickbase_api.league import (
+    from kickbase_api.user import get_budget, get_username
+    from kickbase_api.league import (
     get_league_activities,
     get_league_ranking
-)
-from kickbase_api.manager import (
+    )
+    from kickbase_api.manager import (
     get_managers,
     get_manager_performance,
     get_manager_info,
-)
-from kickbase_api.others import get_achievement_reward
-import pandas as pd
+    )
+    from kickbase_api.others import get_achievement_reward
+    import pandas as pd
 
-def calc_manager_budgets(token, league_id, league_start_date, start_budget):
+    def calc_manager_budgets(token, league_id, league_start_date, start_budget):
     """Calculate manager budgets based on activities, bonuses, and team performance."""
 
     try:
-        activities, login_bonus, achievement_bonus = get_league_activities(token, league_id, league_start_date)
+        activities, login_bonus, achievement_bonus = get_league_activities(
+            token, league_id, league_start_date
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to fetch activities: {e}")
 
     activities_df = pd.DataFrame(activities)
+
+    # --- DEBUG (temporär) ---
     print("ACTIVITY COLUMNS:", activities_df.columns.tolist())
-print(activities_df.head())
+    print(activities_df.head())
+    # ------------------------
 
+    # --- Robust column detection ---
+    BUYER_COL = "byr" if "byr" in activities_df.columns else (
+        "usr" if "usr" in activities_df.columns else None
+    )
+    SELLER_COL = "slr" if "slr" in activities_df.columns else None
+    PRICE_COL = "trp" if "trp" in activities_df.columns else None
 
-    # Bonuses
-    total_login_bonus = sum(entry.get("data", {}).get("bn", 0) for entry in login_bonus)
+    if BUYER_COL is None or PRICE_COL is None:
+        raise RuntimeError(
+            f"Cannot determine buyer/price columns. Columns: {activities_df.columns.tolist()}"
+        )
+
+    # --- Bonuses ---
+    total_login_bonus = sum(
+        entry.get("data", {}).get("bn", 0) for entry in login_bonus
+    )
 
     total_achievement_bonus = 0
     for item in achievement_bonus:
@@ -38,16 +56,12 @@ print(activities_df.head())
         except Exception as e:
             print(f"Warning: Failed to process achievement bonus {item}: {e}")
 
-    # Manager performances
-    try:
-        managers = get_managers(token, league_id)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch managers: {e}")
-
+    # --- Manager performances ---
+    managers = get_managers(token, league_id)
     performances = []
-    for manager in managers:
+
+    for manager_name, manager_id in managers:
         try:
-            manager_name, manager_id = manager
             info = get_manager_info(token, league_id, manager_id)
             team_value = info.get("tv", 0)
 
@@ -55,79 +69,78 @@ print(activities_df.head())
             perf["Team Value"] = team_value
             performances.append(perf)
         except Exception as e:
-            print(f"Warning: Skipping manager {manager}: {e}")
+            print(f"Warning: Skipping manager {manager_name}: {e}")
 
     perf_df = pd.DataFrame(performances)
     if not perf_df.empty:
         perf_df["point_bonus"] = perf_df["tp"].fillna(0) * 1000
     else:
-        perf_df["name"] = []
-        perf_df["point_bonus"] = []
-        perf_df["Team Value"] = []
+        perf_df = pd.DataFrame(columns=["name", "point_bonus", "Team Value"])
 
-    # Initial budgets from activities
-    budgets = {user: start_budget for user in set(activities_df["byr"].dropna().unique())
-                                          .union(set(activities_df["slr"].dropna().unique()))}
+    # --- Initial budgets ---
+    users = set(activities_df[BUYER_COL].dropna().unique())
+    if SELLER_COL:
+        users |= set(activities_df[SELLER_COL].dropna().unique())
+
+    budgets = {user: start_budget for user in users}
 
     for _, row in activities_df.iterrows():
-        byr, slr, trp = row.get("byr"), row.get("slr"), row.get("trp", 0)
-        try:
-            if pd.isna(byr) and pd.notna(slr):
-                budgets[slr] += trp
-            elif pd.isna(slr) and pd.notna(byr):
-                budgets[byr] -= trp
-            elif pd.notna(byr) and pd.notna(slr):
-                budgets[byr] -= trp
-                budgets[slr] += trp
-        except KeyError as e:
-            print(f"Warning: Skipping invalid activity row {row}: {e}")
+        buyer = row.get(BUYER_COL)
+        seller = row.get(SELLER_COL) if SELLER_COL else None
+        price = row.get(PRICE_COL, 0)
+
+        if pd.notna(buyer):
+            budgets[buyer] -= price
+        if pd.notna(seller):
+            budgets[seller] += price
 
     budget_df = pd.DataFrame(list(budgets.items()), columns=["User", "Budget"])
 
-    # Merge performance bonuses
+    # --- Merge performance bonuses ---
     budget_df = budget_df.merge(
         perf_df[["name", "point_bonus", "Team Value"]],
         left_on="User",
         right_on="name",
-        how="left"
+        how="left",
     ).drop(columns=["name"], errors="ignore")
 
-    budget_df["Budget"] = budget_df["Budget"] + budget_df["point_bonus"].fillna(0)
+    budget_df["Budget"] += budget_df["point_bonus"].fillna(0)
     budget_df.drop(columns=["point_bonus"], inplace=True, errors="ignore")
 
-    # add total login bonus equally to everyone (100% estimation, if the user logged in every day)
+    # --- Login bonus ---
     budget_df["Budget"] += total_login_bonus
 
-    # Ensure consistent float format
-    budget_df["Budget"] = budget_df["Budget"].astype(float)
-
-    # add total achievement bonus based on anchor value and current ranking (estimation approach)
+    # --- Achievement bonus (estimation) ---
     for user in budget_df["User"]:
-        achievement_bonus = calc_achievement_bonus_by_points(token, league_id, user, total_achievement_bonus)
-        budget_df.loc[budget_df["User"] == user, "Budget"] += achievement_bonus
+        bonus = calc_achievement_bonus_by_points(
+            token, league_id, user, total_achievement_bonus
+        )
+        budget_df.loc[budget_df["User"] == user, "Budget"] += bonus
 
-    # Sync with own actual budget
+    # --- Sync own budget ---
     try:
         own_budget = get_budget(token, league_id)
         own_username = get_username(token)
-        mask = budget_df["User"] == own_username
-        if not budget_df.loc[mask, "Budget"].eq(own_budget).all():
-            budget_df.loc[mask, "Budget"] = own_budget
+        budget_df.loc[budget_df["User"] == own_username, "Budget"] = own_budget
     except Exception as e:
         print(f"Warning: Could not sync own budget: {e}")
 
-    # TODO check if this also applies if the user has positiv budget, currently only tested with negative budget
-    budget_df["Max Negative"] = (budget_df["Team Value"].fillna(0) + budget_df["Budget"]) * -0.33
+    # --- Available budget calculation ---
+    budget_df["Max Negative"] = (
+        budget_df["Team Value"].fillna(0) + budget_df["Budget"]
+    ) * -0.33
 
-    # Calculate available budget
-    budget_df["Available Budget"] = (budget_df["Max Negative"].fillna(0) - budget_df["Budget"]) * -1
+    budget_df["Available Budget"] = (
+        budget_df["Max Negative"].fillna(0) - budget_df["Budget"]
+    ) * -1
 
-    # Sort by available budget ascending
-    budget_df.sort_values("Available Budget", ascending=False, inplace=True, ignore_index=True)
+    budget_df.sort_values(
+        "Available Budget", ascending=False, inplace=True, ignore_index=True
+    )
 
     return budget_df
 
-def calc_achievement_bonus_by_points(token, league_id, username, anchor_achievement_bonus):
+    def calc_achievement_bonus_by_points(token, league_id, username, anchor_achievement_bonus):
     """Estimate achievement bonus for a user based on their total points compared to anchor user."""
 
     ranking = get_league_ranking(token, league_id)
@@ -164,7 +177,7 @@ def calc_achievement_bonus_by_points(token, league_id, username, anchor_achievem
     estimated_bonus = anchor_achievement_bonus * scale
     return estimated_bonus
 
-def calc_achievement_bonus_by_rank(token, league_id, username, anchor_achievement_bonus):
+    def calc_achievement_bonus_by_rank(token, league_id, username, anchor_achievement_bonus):
     """Estimate achievement bonus for a user based on their ranking."""
     """Currently not used, kept for reference."""
 
